@@ -2,7 +2,7 @@
 BlackLock explores the use of Ring Learning with Rounding (RLWR) for post-quantum secure communication, with potential applications in VPN security. This conceptual project focuses on efficient key generation, encryption, and decryption using the Number Theoretic Transform (NTT) for quantum-resistant encryption.
 
 ## About
-Developed by Toby Davis, BlackLock is a conceptual project designed to explore innovative applications of RLWR in post-quantum cryptography. While this is not a fully working algorithm, it provides a foundation for research into secure communication technologies resistant to the threats posed by quantum computing.
+Developed by Toby Davis (that would be me), BlackLock is a conceptual project designed to explore innovative applications of RLWR in post-quantum cryptography. While this is not a fully working algorithm, it provides a foundation for research into secure communication technologies resistant to the threats posed by quantum computing.
 
 ## Attribution Requirement
 If you use BlackLock in any academic or research project, publication, or derivative work, **you are required to credit the author**. Please include the following citation in your research or publication:
