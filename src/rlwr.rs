@@ -2,6 +2,9 @@
 //! 
 //! RLWR is a variant of Ring-LWE that uses deterministic rounding instead of
 //! random error sampling, providing similar security with improved efficiency.
+//! 
+//! Key insight: Instead of adding small random error e, we round coefficients
+//! from Z_q to Z_p where p < q. The rounding "noise" replaces explicit error.
 
 use crate::error::BlackLockError;
 use crate::ntt::NttTables;
@@ -23,10 +26,10 @@ pub struct KeyPair {
 /// Public key for encryption
 #[derive(Clone)]
 pub struct PublicKey {
-    /// Public polynomial a (in NTT domain for efficiency)
+    /// Public polynomial a (stored in NTT domain)
     a_ntt: Vec<u64>,
-    /// Public polynomial b = a * s + e (in NTT domain)
-    b_ntt: Vec<u64>,
+    /// Public polynomial b = round_p(a * s) (stored in coefficient domain, mod p)
+    b: Vec<u64>,
     /// NTT tables
     ntt: NttTables,
     /// Parameters
@@ -36,7 +39,7 @@ pub struct PublicKey {
 /// Secret key for decryption (zeroized on drop for security)
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SecretKey {
-    /// Secret polynomial s (in NTT domain for efficiency)
+    /// Secret polynomial s (stored in NTT domain)
     s_ntt: Vec<u64>,
     /// Parameters (not sensitive, but included for convenience)
     #[zeroize(skip)]
@@ -49,14 +52,28 @@ pub struct SecretKey {
 /// Encrypted ciphertext
 #[derive(Clone)]
 pub struct Ciphertext {
-    /// First component: u = a * r + e1 (coefficient domain)
-    u: Vec<u64>,
-    /// Second component: v = b * r + e2 + encode(m) (coefficient domain)
-    v: Vec<u64>,
+    /// First component: c1 = round_p(a * r) (mod p)
+    c1: Vec<u64>,
+    /// Second component: c2 = round_p(scale(b) * r) + encode(m) (mod p)
+    c2: Vec<u64>,
     /// Original message length
     msg_len: usize,
     /// Parameters used
     params: Parameters,
+}
+
+/// Round from Z_q to Z_p: round_p(x) = floor((p * x + q/2) / q) mod p
+#[inline]
+fn round_to_p(x: u64, q: u64, p: u64) -> u64 {
+    // This computes floor((p * x + q/2) / q)
+    let scaled = (p as u128) * (x as u128) + (q as u128 / 2);
+    ((scaled / (q as u128)) % (p as u128)) as u64
+}
+
+/// Scale from Z_p back to Z_q: scale(x) = floor(q * x / p)
+#[inline]
+fn scale_to_q(x: u64, q: u64, p: u64) -> u64 {
+    (((q as u128) * (x as u128)) / (p as u128)) as u64
 }
 
 impl KeyPair {
@@ -71,44 +88,33 @@ impl KeyPair {
         let ntt = NttTables::new(&params);
         let mut rng = StdRng::from_entropy();
         let q = params.q;
+        let p = params.p;
         let n = params.n;
         
-        // Generate random public polynomial a
+        // Generate random public polynomial a ∈ R_q
         let mut a: Vec<u64> = (0..n)
             .map(|_| rng.next_u64() % q)
             .collect();
         
         // Generate secret polynomial s with small coefficients
-        let mut s: Vec<u64> = sample_secret(&mut rng, n, params.eta, q);
-        
-        // Generate small error polynomial e
-        let e: Vec<u64> = sample_secret(&mut rng, n, params.eta, q);
-        
-        // Transform to NTT domain
-        ntt.forward(&mut a);
-        ntt.forward(&mut s);
+        let mut s: Vec<u64> = sample_ternary_secret(&mut rng, n, q);
         
         // Compute a * s in NTT domain
+        ntt.forward(&mut a);
+        ntt.forward(&mut s);
         let as_ntt = ntt.pointwise_mul(&a, &s);
         
-        // Transform back to compute a*s + e
+        // Transform back to coefficient domain
         let mut as_poly = as_ntt;
         ntt.inverse(&mut as_poly);
         
-        // Add error: b = a*s + e
-        let mut b: Vec<u64> = as_poly.iter()
-            .zip(e.iter())
-            .map(|(&as_val, &e_val)| {
-                let sum = as_val + e_val;
-                if sum >= q { sum - q } else { sum }
-            })
+        // Round to Z_p: b = round_p(a * s)
+        let b: Vec<u64> = as_poly.iter()
+            .map(|&x| round_to_p(x, q, p))
             .collect();
         
-        // Store b in NTT domain for faster encryption
-        ntt.forward(&mut b);
-        
         Ok(Self {
-            public_key: PublicKey { a_ntt: a, b_ntt: b, ntt: ntt.clone(), params },
+            public_key: PublicKey { a_ntt: a, b, ntt: ntt.clone(), params },
             secret_key: SecretKey { s_ntt: s, params, ntt },
         })
     }
@@ -126,11 +132,9 @@ impl KeyPair {
     /// Serialize the keypair to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        
-        // Serialize public key
         bytes.extend(self.public_key.to_bytes());
         
-        // Serialize secret key (need to inverse NTT first for storage)
+        // Store secret in coefficient form
         let mut s = self.secret_key.s_ntt.clone();
         self.secret_key.ntt.inverse(&mut s);
         for &coeff in &s {
@@ -152,58 +156,63 @@ impl PublicKey {
         }
         
         let q = self.params.q;
+        let p = self.params.p;
         let n = self.params.n;
         
-        // Use SHAKE256 to derive randomness
+        // Derive randomness using SHAKE256
         let mut hasher = Shake256::default();
         hasher.update(message);
-        hasher.update(&rand::random::<[u8; 32]>()); // Random nonce for CPA security
+        hasher.update(&rand::random::<[u8; 32]>());
         let mut reader = hasher.finalize_xof();
         
-        // Generate ephemeral secret r and errors e1, e2
-        let mut r = sample_secret_from_xof(&mut reader, n, self.params.eta, q);
-        let e1 = sample_secret_from_xof(&mut reader, n, self.params.eta, q);
-        let e2 = sample_secret_from_xof(&mut reader, n, self.params.eta, q);
+        // Generate ephemeral secret r with small coefficients
+        let mut r = sample_ternary_secret_from_xof(&mut reader, n, q);
         
-        // Transform r to NTT domain
+        // Compute c1 = round_p(a * r)
         self.ntt.forward(&mut r);
-        
-        // Compute u = a * r + e1
         let ar_ntt = self.ntt.pointwise_mul(&self.a_ntt, &r);
         let mut ar = ar_ntt;
         self.ntt.inverse(&mut ar);
         
-        let u: Vec<u64> = ar.iter()
-            .zip(e1.iter())
-            .map(|(&ar_val, &e_val)| {
-                let sum = ar_val + e_val;
-                if sum >= q { sum - q } else { sum }
-            })
+        let c1: Vec<u64> = ar.iter()
+            .map(|&x| round_to_p(x, q, p))
             .collect();
         
-        // Compute v = b * r + e2 + encode(message)
-        let br_ntt = self.ntt.pointwise_mul(&self.b_ntt, &r);
+        // Compute c2 = round_p(scale(b) * r) + encode(m)
+        // First scale b back to Z_q
+        let b_scaled: Vec<u64> = self.b.iter()
+            .map(|&x| scale_to_q(x, q, p))
+            .collect();
+        
+        let mut b_ntt = b_scaled;
+        self.ntt.forward(&mut b_ntt);
+        let br_ntt = self.ntt.pointwise_mul(&b_ntt, &r);
         let mut br = br_ntt;
         self.ntt.inverse(&mut br);
         
-        // Encode message: each bit becomes 0 or q/2
-        let encoded = encode_message(message, n, q);
-        
-        let v: Vec<u64> = br.iter()
-            .zip(e2.iter())
-            .zip(encoded.iter())
-            .map(|((&br_val, &e_val), &m_val)| {
-                let mut sum = br_val + e_val + m_val;
-                while sum >= q {
-                    sum -= q;
-                }
-                sum
-            })
+        // Round to Z_p
+        let mut c2: Vec<u64> = br.iter()
+            .map(|&x| round_to_p(x, q, p))
             .collect();
         
+        // Encode message and add to c2
+        // Each bit is encoded as 0 or p/2
+        let half_p = p / 2;
+        for (i, &byte) in message.iter().enumerate() {
+            for bit_idx in 0..8 {
+                let coeff_idx = i * 8 + bit_idx;
+                if coeff_idx < n {
+                    let bit = (byte >> bit_idx) & 1;
+                    if bit == 1 {
+                        c2[coeff_idx] = (c2[coeff_idx] + half_p) % p;
+                    }
+                }
+            }
+        }
+        
         Ok(Ciphertext {
-            u,
-            v,
+            c1,
+            c2,
             msg_len: message.len(),
             params: self.params,
         })
@@ -221,16 +230,15 @@ impl PublicKey {
             _ => 255,
         });
         
-        // Store in coefficient form for interoperability
+        // Store a in coefficient form
         let mut a = self.a_ntt.clone();
-        let mut b = self.b_ntt.clone();
         self.ntt.inverse(&mut a);
-        self.ntt.inverse(&mut b);
         
         for &coeff in &a {
             bytes.extend(&coeff.to_le_bytes());
         }
-        for &coeff in &b {
+        // b is already in coefficient form (mod p), but we store as u64
+        for &coeff in &self.b {
             bytes.extend(&coeff.to_le_bytes());
         }
         
@@ -242,28 +250,32 @@ impl SecretKey {
     /// Decrypt a ciphertext using this secret key
     pub fn decrypt(&self, ciphertext: &Ciphertext) -> Result<Vec<u8>> {
         let q = self.params.q;
+        let p = self.params.p;
         
-        // Transform u to NTT domain
-        let mut u_ntt = ciphertext.u.clone();
-        self.ntt.forward(&mut u_ntt);
-        
-        // Compute u * s in NTT domain
-        let us_ntt = self.ntt.pointwise_mul(&u_ntt, &self.s_ntt);
-        
-        // Transform back
-        let mut us = us_ntt;
-        self.ntt.inverse(&mut us);
-        
-        // Compute v - u*s
-        let noisy_message: Vec<u64> = ciphertext.v.iter()
-            .zip(us.iter())
-            .map(|(&v, &us_val)| {
-                if v >= us_val { v - us_val } else { v + q - us_val }
-            })
+        // Scale c1 back to Z_q and compute c1 * s
+        let c1_scaled: Vec<u64> = ciphertext.c1.iter()
+            .map(|&x| scale_to_q(x, q, p))
             .collect();
         
-        // Decode message using threshold decoding
-        decode_message(&noisy_message, ciphertext.msg_len, q)
+        let mut c1_ntt = c1_scaled;
+        self.ntt.forward(&mut c1_ntt);
+        let c1s_ntt = self.ntt.pointwise_mul(&c1_ntt, &self.s_ntt);
+        let mut c1s = c1s_ntt;
+        self.ntt.inverse(&mut c1s);
+        
+        // Round c1*s to Z_p
+        let c1s_rounded: Vec<u64> = c1s.iter()
+            .map(|&x| round_to_p(x, q, p))
+            .collect();
+        
+        // Compute c2 - round_p(c1 * s) mod p
+        let noisy_msg: Vec<u64> = ciphertext.c2.iter()
+            .zip(c1s_rounded.iter())
+            .map(|(&c2, &c1s)| (c2 + p - c1s) % p)
+            .collect();
+        
+        // Decode message using threshold
+        decode_message(&noisy_msg, ciphertext.msg_len, p)
     }
 }
 
@@ -272,10 +284,8 @@ impl Ciphertext {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         
-        // Message length
         bytes.extend(&(self.msg_len as u32).to_le_bytes());
         
-        // Security level indicator
         bytes.push(match self.params.n {
             512 => 0,
             1024 => 1,
@@ -283,13 +293,10 @@ impl Ciphertext {
             _ => 255,
         });
         
-        // u coefficients
-        for &coeff in &self.u {
+        for &coeff in &self.c1 {
             bytes.extend(&coeff.to_le_bytes());
         }
-        
-        // v coefficients
-        for &coeff in &self.v {
+        for &coeff in &self.c2 {
             bytes.extend(&coeff.to_le_bytes());
         }
         
@@ -303,7 +310,6 @@ impl Ciphertext {
         }
         
         let params = level.params();
-        
         let msg_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
         
         let expected_len = 5 + params.n * 8 * 2;
@@ -312,15 +318,15 @@ impl Ciphertext {
         }
         
         let mut offset = 5;
-        let mut u = Vec::with_capacity(params.n);
-        let mut v = Vec::with_capacity(params.n);
+        let mut c1 = Vec::with_capacity(params.n);
+        let mut c2 = Vec::with_capacity(params.n);
         
         for _ in 0..params.n {
             let coeff = u64::from_le_bytes([
                 bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3],
                 bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7],
             ]);
-            u.push(coeff);
+            c1.push(coeff);
             offset += 8;
         }
         
@@ -329,91 +335,64 @@ impl Ciphertext {
                 bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3],
                 bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7],
             ]);
-            v.push(coeff);
+            c2.push(coeff);
             offset += 8;
         }
         
-        Ok(Self { u, v, msg_len, params })
+        Ok(Self { c1, c2, msg_len, params })
     }
 }
 
-/// Sample a secret polynomial with small coefficients from centered binomial distribution
-fn sample_secret(rng: &mut impl RngCore, n: usize, eta: u32, q: u64) -> Vec<u64> {
+/// Sample a ternary secret polynomial with coefficients in {-1, 0, 1}
+fn sample_ternary_secret(rng: &mut impl RngCore, n: usize, q: u64) -> Vec<u64> {
     (0..n)
         .map(|_| {
-            let mut a = 0i32;
-            let mut b = 0i32;
-            for _ in 0..eta {
-                a += (rng.next_u32() & 1) as i32;
-                b += (rng.next_u32() & 1) as i32;
-            }
-            let val = a - b;
-            if val < 0 {
-                (q as i64 + val as i64) as u64
-            } else {
-                val as u64
+            let r = rng.next_u32() % 3;
+            match r {
+                0 => 0,
+                1 => 1,
+                2 => q - 1, // -1 mod q
+                _ => unreachable!(),
             }
         })
         .collect()
 }
 
-/// Sample secret from XOF (for deterministic randomness)
-fn sample_secret_from_xof(reader: &mut impl XofReader, n: usize, eta: u32, q: u64) -> Vec<u64> {
-    let mut buf = [0u8; 4];
+/// Sample ternary secret from XOF
+fn sample_ternary_secret_from_xof(reader: &mut impl XofReader, n: usize, q: u64) -> Vec<u64> {
+    let mut buf = [0u8; 1];
     (0..n)
         .map(|_| {
-            let mut a = 0i32;
-            let mut b = 0i32;
-            for _ in 0..eta {
+            loop {
                 reader.read(&mut buf);
-                a += (buf[0] & 1) as i32;
-                b += (buf[1] & 1) as i32;
-            }
-            let val = a - b;
-            if val < 0 {
-                (q as i64 + val as i64) as u64
-            } else {
-                val as u64
+                let r = buf[0] % 4;
+                if r < 3 {
+                    return match r {
+                        0 => 0,
+                        1 => 1,
+                        2 => q - 1,
+                        _ => unreachable!(),
+                    };
+                }
+                // Rejection sampling for uniformity
             }
         })
         .collect()
 }
 
-/// Encode a message into polynomial coefficients
-/// Each message bit is encoded as either 0 or q/2
-fn encode_message(message: &[u8], n: usize, q: u64) -> Vec<u64> {
-    let mut encoded = vec![0u64; n];
-    let half_q = q / 2;
-    
-    for (i, &byte) in message.iter().enumerate() {
-        for bit_idx in 0..8 {
-            let coeff_idx = i * 8 + bit_idx;
-            if coeff_idx < n {
-                let bit = (byte >> bit_idx) & 1;
-                encoded[coeff_idx] = if bit == 1 { half_q } else { 0 };
-            }
-        }
-    }
-    
-    encoded
-}
-
-/// Decode a message from polynomial coefficients using threshold decoding
-/// Values closer to 0 decode as 0, values closer to q/2 decode as 1
-fn decode_message(coeffs: &[u64], msg_len: usize, q: u64) -> Result<Vec<u8>> {
+/// Decode message using threshold decoding in Z_p
+fn decode_message(coeffs: &[u64], msg_len: usize, p: u64) -> Result<Vec<u8>> {
     let mut message = vec![0u8; msg_len];
-    let quarter_q = q / 4;
-    let three_quarter_q = (3 * q) / 4;
+    let quarter_p = p / 4;
+    let three_quarter_p = (3 * p) / 4;
     
     for (i, byte) in message.iter_mut().enumerate() {
         for bit_idx in 0..8 {
             let coeff_idx = i * 8 + bit_idx;
             if coeff_idx < coeffs.len() {
                 let val = coeffs[coeff_idx];
-                // Threshold decode:
-                // Values in [q/4, 3q/4) are closer to q/2 -> decode as 1
-                // Values in [0, q/4) or [3q/4, q) are closer to 0 -> decode as 0
-                let bit = if val >= quarter_q && val < three_quarter_q {
+                // Values in [p/4, 3p/4) decode as 1
+                let bit = if val >= quarter_p && val < three_quarter_p {
                     1u8
                 } else {
                     0u8
@@ -431,26 +410,41 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_encode_decode() {
-        let message = b"Hello!";
+    fn test_round_scale_inverse() {
         let q = 12289u64;
-        let n = 512;
+        let p = 256u64;
         
-        let encoded = encode_message(message, n, q);
-        let decoded = decode_message(&encoded, message.len(), q).unwrap();
-        
-        assert_eq!(message.to_vec(), decoded);
+        // Test that scale(round(x)) ≈ x
+        for x in [0, 100, 1000, 6000, 12000] {
+            let rounded = round_to_p(x, q, p);
+            let scaled = scale_to_q(rounded, q, p);
+            let diff = if x > scaled { x - scaled } else { scaled - x };
+            assert!(diff < q / p + 1, "Round-scale error too large");
+        }
     }
     
     #[test]
     fn test_encrypt_decrypt() {
         let keypair = KeyPair::generate(SecurityLevel::Medium).unwrap();
-        let message = b"Test message for BlackLock encryption";
+        let message = b"Test RLWR encryption!";
         
         let ciphertext = keypair.public_key().encrypt(message).unwrap();
         let decrypted = keypair.secret_key().decrypt(&ciphertext).unwrap();
         
         assert_eq!(message.to_vec(), decrypted);
+    }
+    
+    #[test]
+    fn test_all_security_levels() {
+        for level in [SecurityLevel::Low, SecurityLevel::Medium, SecurityLevel::High] {
+            let keypair = KeyPair::generate(level).unwrap();
+            let message = b"Testing all levels";
+            
+            let ct = keypair.public_key().encrypt(message).unwrap();
+            let dec = keypair.secret_key().decrypt(&ct).unwrap();
+            
+            assert_eq!(message.to_vec(), dec, "Failed at {:?}", level);
+        }
     }
     
     #[test]
@@ -464,16 +458,5 @@ mod tests {
         
         let decrypted = keypair.secret_key().decrypt(&restored).unwrap();
         assert_eq!(message.to_vec(), decrypted);
-    }
-    
-    #[test]
-    fn test_multiple_messages() {
-        let keypair = KeyPair::generate(SecurityLevel::Low).unwrap();
-        
-        for msg in [b"Short".as_slice(), b"A longer test message", b"!@#$%^&*()"] {
-            let ct = keypair.public_key().encrypt(msg).unwrap();
-            let dec = keypair.secret_key().decrypt(&ct).unwrap();
-            assert_eq!(msg.to_vec(), dec);
-        }
     }
 }
