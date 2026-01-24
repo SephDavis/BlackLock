@@ -1,21 +1,17 @@
 //! Number Theoretic Transform (NTT) for efficient polynomial multiplication
 //! 
-//! NTT is the finite field analogue of FFT, enabling O(n log n) polynomial
-//! multiplication instead of O(n²).
+//! This NTT implements negacyclic convolution for the ring Z_q[x]/(x^n + 1),
+//! which is required for Ring-LWE based cryptography.
 
 use crate::params::Parameters;
 
 /// Precomputed NTT tables for a given parameter set
 #[derive(Clone)]
 pub struct NttTables {
-    /// Root of unity
-    root: u64,
-    /// Inverse root of unity
-    root_inv: u64,
-    /// Twiddle factors for forward NTT
-    twiddles: Vec<u64>,
-    /// Twiddle factors for inverse NTT
-    twiddles_inv: Vec<u64>,
+    /// Powers of psi (2n-th root of unity) for forward transform
+    psi_powers: Vec<u64>,
+    /// Powers of psi^(-1) for inverse transform
+    psi_inv_powers: Vec<u64>,
     /// Modulus
     q: u64,
     /// Dimension
@@ -30,109 +26,104 @@ impl NttTables {
         let n = params.n;
         let q = params.q;
         
-        // Find primitive 2n-th root of unity
-        // For q = 12289, a primitive root is 11
-        let g = find_primitive_root(q);
-        let root = mod_exp(g, (q - 1) / (2 * n as u64), q);
-        let root_inv = mod_inverse(root, q);
+        // For negacyclic NTT, we need a primitive 2n-th root of unity (psi)
+        // such that psi^(2n) = 1 and psi^n = -1
+        // For q = 12289, we have q - 1 = 12288 = 2^12 * 3
+        // We need 2n | (q-1), which is satisfied for n = 512, 1024, 2048
+        
+        let g = find_generator(q);
+        // psi = g^((q-1)/(2n)) is a primitive 2n-th root of unity
+        let psi = mod_exp(g, (q - 1) / (2 * n as u64), q);
+        let psi_inv = mod_inverse(psi, q);
         let n_inv = mod_inverse(n as u64, q);
         
-        // Precompute twiddle factors
-        let mut twiddles = vec![0u64; n];
-        let mut twiddles_inv = vec![0u64; n];
-        
-        twiddles[0] = 1;
-        twiddles_inv[0] = 1;
-        
-        for i in 1..n {
-            twiddles[i] = (twiddles[i - 1] * root) % q;
-            twiddles_inv[i] = (twiddles_inv[i - 1] * root_inv) % q;
-        }
-        
-        // Bit-reverse the twiddle factors for in-place NTT
-        let twiddles = bit_reverse_vec(&twiddles);
-        let twiddles_inv = bit_reverse_vec(&twiddles_inv);
+        // Precompute powers of psi in bit-reversed order for the NTT
+        let psi_powers = compute_powers_bitrev(psi, n, q);
+        let psi_inv_powers = compute_powers_bitrev(psi_inv, n, q);
         
         Self {
-            root,
-            root_inv,
-            twiddles,
-            twiddles_inv,
+            psi_powers,
+            psi_inv_powers,
             q,
             n,
             n_inv,
         }
     }
     
-    /// Forward NTT (in-place, Cooley-Tukey butterfly)
-    pub fn forward(&self, poly: &mut [u64]) {
-        assert_eq!(poly.len(), self.n);
+    /// Forward NTT: transforms polynomial to NTT domain
+    /// Input: polynomial coefficients a[0], a[1], ..., a[n-1]
+    /// Output: NTT(a) for negacyclic convolution
+    pub fn forward(&self, a: &mut [u64]) {
+        debug_assert_eq!(a.len(), self.n);
         
         let n = self.n;
         let q = self.q;
         
-        // Bit-reverse copy
-        bit_reverse_inplace(poly);
-        
-        // Cooley-Tukey iterative NTT
+        let mut t = n;
         let mut m = 1;
+        
         while m < n {
-            let w_m = mod_exp(self.root, (n / (2 * m)) as u64, q);
-            
-            for k in (0..n).step_by(2 * m) {
-                let mut w = 1u64;
-                for j in 0..m {
-                    let t = (w * poly[k + j + m]) % q;
-                    let u = poly[k + j];
-                    poly[k + j] = (u + t) % q;
-                    poly[k + j + m] = (u + q - t) % q;
-                    w = (w * w_m) % q;
+            t /= 2;
+            for i in 0..m {
+                let j1 = 2 * i * t;
+                let j2 = j1 + t;
+                let s = self.psi_powers[m + i];
+                
+                for j in j1..j2 {
+                    let u = a[j];
+                    let v = mul_mod(a[j + t], s, q);
+                    a[j] = add_mod(u, v, q);
+                    a[j + t] = sub_mod(u, v, q);
                 }
             }
             m *= 2;
         }
     }
     
-    /// Inverse NTT (in-place, Gentleman-Sande butterfly)
-    pub fn inverse(&self, poly: &mut [u64]) {
-        assert_eq!(poly.len(), self.n);
+    /// Inverse NTT: transforms from NTT domain back to coefficient domain
+    pub fn inverse(&self, a: &mut [u64]) {
+        debug_assert_eq!(a.len(), self.n);
         
         let n = self.n;
         let q = self.q;
         
-        // Gentleman-Sande iterative inverse NTT
-        let mut m = n / 2;
-        while m >= 1 {
-            let w_m = mod_exp(self.root_inv, (n / (2 * m)) as u64, q);
+        let mut t = 1;
+        let mut m = n;
+        
+        while m > 1 {
+            let h = m / 2;
+            let mut j1 = 0;
             
-            for k in (0..n).step_by(2 * m) {
-                let mut w = 1u64;
-                for j in 0..m {
-                    let u = poly[k + j];
-                    let v = poly[k + j + m];
-                    poly[k + j] = (u + v) % q;
-                    poly[k + j + m] = (w * ((u + q - v) % q)) % q;
-                    w = (w * w_m) % q;
+            for i in 0..h {
+                let j2 = j1 + t;
+                let s = self.psi_inv_powers[h + i];
+                
+                for j in j1..j2 {
+                    let u = a[j];
+                    let v = a[j + t];
+                    a[j] = add_mod(u, v, q);
+                    a[j + t] = mul_mod(sub_mod(u, v, q), s, q);
                 }
+                j1 += 2 * t;
             }
-            m /= 2;
+            t *= 2;
+            m = h;
         }
         
-        // Bit-reverse and scale by n^(-1)
-        bit_reverse_inplace(poly);
-        for coeff in poly.iter_mut() {
-            *coeff = (*coeff * self.n_inv) % q;
+        // Scale by n^(-1)
+        for coeff in a.iter_mut() {
+            *coeff = mul_mod(*coeff, self.n_inv, q);
         }
     }
     
-    /// Multiply two polynomials in NTT domain (pointwise)
+    /// Pointwise multiplication in NTT domain
     pub fn pointwise_mul(&self, a: &[u64], b: &[u64]) -> Vec<u64> {
-        assert_eq!(a.len(), self.n);
-        assert_eq!(b.len(), self.n);
+        debug_assert_eq!(a.len(), self.n);
+        debug_assert_eq!(b.len(), self.n);
         
         a.iter()
             .zip(b.iter())
-            .map(|(&x, &y)| (x * y) % self.q)
+            .map(|(&x, &y)| mul_mod(x, y, self.q))
             .collect()
     }
     
@@ -140,7 +131,7 @@ impl NttTables {
     pub fn poly_add(&self, a: &[u64], b: &[u64]) -> Vec<u64> {
         a.iter()
             .zip(b.iter())
-            .map(|(&x, &y)| (x + y) % self.q)
+            .map(|(&x, &y)| add_mod(x, y, self.q))
             .collect()
     }
     
@@ -148,9 +139,66 @@ impl NttTables {
     pub fn poly_sub(&self, a: &[u64], b: &[u64]) -> Vec<u64> {
         a.iter()
             .zip(b.iter())
-            .map(|(&x, &y)| (x + self.q - y) % self.q)
+            .map(|(&x, &y)| sub_mod(x, y, self.q))
             .collect()
     }
+}
+
+/// Compute powers of w in bit-reversed order
+fn compute_powers_bitrev(w: u64, n: usize, q: u64) -> Vec<u64> {
+    let mut powers = vec![0u64; n];
+    powers[0] = 1;
+    
+    for i in 1..n {
+        powers[i] = mul_mod(powers[i - 1], w, q);
+    }
+    
+    // Bit-reverse the array
+    bit_reverse_array(&mut powers);
+    powers
+}
+
+/// Bit-reverse permutation of an array
+fn bit_reverse_array(a: &mut [u64]) {
+    let n = a.len();
+    let log_n = (n as f64).log2() as u32;
+    
+    for i in 0..n {
+        let j = bit_reverse(i, log_n);
+        if i < j {
+            a.swap(i, j);
+        }
+    }
+}
+
+/// Reverse the bits of x, considering only 'bits' number of bits
+fn bit_reverse(x: usize, bits: u32) -> usize {
+    let mut result = 0;
+    let mut x = x;
+    for _ in 0..bits {
+        result = (result << 1) | (x & 1);
+        x >>= 1;
+    }
+    result
+}
+
+/// Modular addition
+#[inline(always)]
+fn add_mod(a: u64, b: u64, q: u64) -> u64 {
+    let sum = a + b;
+    if sum >= q { sum - q } else { sum }
+}
+
+/// Modular subtraction
+#[inline(always)]
+fn sub_mod(a: u64, b: u64, q: u64) -> u64 {
+    if a >= b { a - b } else { a + q - b }
+}
+
+/// Modular multiplication using u128 to avoid overflow
+#[inline(always)]
+fn mul_mod(a: u64, b: u64, q: u64) -> u64 {
+    ((a as u128 * b as u128) % q as u128) as u64
 }
 
 /// Modular exponentiation using binary method
@@ -159,19 +207,18 @@ pub fn mod_exp(base: u64, mut exp: u64, modulus: u64) -> u64 {
         return 0;
     }
     
-    let mut result = 1u128;
-    let mut base = (base as u128) % (modulus as u128);
-    let modulus = modulus as u128;
+    let mut result = 1u64;
+    let mut base = base % modulus;
     
     while exp > 0 {
         if exp & 1 == 1 {
-            result = (result * base) % modulus;
+            result = mul_mod(result, base, modulus);
         }
         exp >>= 1;
-        base = (base * base) % modulus;
+        base = mul_mod(base, base, modulus);
     }
     
-    result as u64
+    result
 }
 
 /// Extended Euclidean algorithm for modular inverse
@@ -185,87 +232,56 @@ pub fn mod_inverse(a: u64, m: u64) -> u64 {
         xy = (xy.1, xy.0 - q * xy.1);
     }
     
-    while xy.0 < 0 {
-        xy.0 += m as i128;
-    }
-    
-    (xy.0 % m as i128) as u64
+    ((xy.0 % m as i128 + m as i128) % m as i128) as u64
 }
 
-/// Find a primitive root modulo p (p must be prime)
-fn find_primitive_root(p: u64) -> u64 {
-    // For q = 12289, the primitive root is 11
-    if p == 12289 {
+/// Find a generator of Z_q^* (primitive root modulo q)
+fn find_generator(q: u64) -> u64 {
+    // For q = 12289, the generator is 11
+    if q == 12289 {
         return 11;
     }
     
-    // General case: find smallest primitive root
-    let phi = p - 1;
-    let mut factors = Vec::new();
-    let mut n = phi;
+    // General case: find a generator
+    let phi = q - 1;
+    let factors = factorize(phi);
     
-    for i in 2..=((n as f64).sqrt() as u64 + 1) {
-        if n % i == 0 {
-            factors.push(i);
-            while n % i == 0 {
-                n /= i;
-            }
-        }
-    }
-    if n > 1 {
-        factors.push(n);
-    }
-    
-    for g in 2..p {
-        let mut is_primitive = true;
-        for &factor in &factors {
-            if mod_exp(g, phi / factor, p) == 1 {
-                is_primitive = false;
+    for g in 2..q {
+        let mut is_generator = true;
+        for &f in &factors {
+            if mod_exp(g, phi / f, q) == 1 {
+                is_generator = false;
                 break;
             }
         }
-        if is_primitive {
+        if is_generator {
             return g;
         }
     }
     
-    panic!("No primitive root found for {}", p);
+    panic!("No generator found for q = {}", q);
 }
 
-/// Bit-reverse permutation in-place
-fn bit_reverse_inplace(data: &mut [u64]) {
-    let n = data.len();
-    let bits = (n as f64).log2() as u32;
+/// Factorize n into its prime factors (just the factors, not multiplicities)
+fn factorize(mut n: u64) -> Vec<u64> {
+    let mut factors = Vec::new();
+    let mut d = 2;
     
-    for i in 0..n {
-        let j = bit_reverse(i as u32, bits) as usize;
-        if i < j {
-            data.swap(i, j);
+    while d * d <= n {
+        if n % d == 0 {
+            factors.push(d);
+            while n % d == 0 {
+                n /= d;
+            }
         }
+        d += 1;
     }
-}
-
-/// Bit-reverse a vector (returns new vector)
-fn bit_reverse_vec(data: &[u64]) -> Vec<u64> {
-    let n = data.len();
-    let bits = (n as f64).log2() as u32;
     
-    let mut result = vec![0u64; n];
-    for i in 0..n {
-        let j = bit_reverse(i as u32, bits) as usize;
-        result[j] = data[i];
+    if n > 1 {
+        factors.push(n);
     }
-    result
-}
-
-/// Reverse bits of an integer
-fn bit_reverse(mut x: u32, bits: u32) -> u32 {
-    let mut result = 0u32;
-    for _ in 0..bits {
-        result = (result << 1) | (x & 1);
-        x >>= 1;
-    }
-    result
+    
+    factors
 }
 
 #[cfg(test)]
@@ -288,6 +304,64 @@ mod tests {
     }
     
     #[test]
+    fn test_ntt_multiplication() {
+        // Test that NTT multiplication gives negacyclic convolution
+        let params = SecurityLevel::Low.params();
+        let tables = NttTables::new(&params);
+        let n = params.n;
+        let q = params.q;
+        
+        // Simple test: (1 + x) * (1 + x) = 1 + 2x + x^2
+        let mut a = vec![0u64; n];
+        let mut b = vec![0u64; n];
+        a[0] = 1;
+        a[1] = 1;
+        b[0] = 1;
+        b[1] = 1;
+        
+        tables.forward(&mut a);
+        tables.forward(&mut b);
+        let mut c = tables.pointwise_mul(&a, &b);
+        tables.inverse(&mut c);
+        
+        assert_eq!(c[0], 1);
+        assert_eq!(c[1], 2);
+        assert_eq!(c[2], 1);
+        for i in 3..n {
+            assert_eq!(c[i], 0);
+        }
+    }
+    
+    #[test]
+    fn test_negacyclic() {
+        // Test that x^n = -1 in the ring
+        // Multiply x^(n-1) * x should give -1 (which is q-1)
+        let params = SecurityLevel::Low.params();
+        let tables = NttTables::new(&params);
+        let n = params.n;
+        let q = params.q;
+        
+        // a = x^(n-1)
+        let mut a = vec![0u64; n];
+        a[n - 1] = 1;
+        
+        // b = x
+        let mut b = vec![0u64; n];
+        b[1] = 1;
+        
+        tables.forward(&mut a);
+        tables.forward(&mut b);
+        let mut c = tables.pointwise_mul(&a, &b);
+        tables.inverse(&mut c);
+        
+        // Result should be x^n = -1 = q-1 in constant term
+        assert_eq!(c[0], q - 1);
+        for i in 1..n {
+            assert_eq!(c[i], 0);
+        }
+    }
+    
+    #[test]
     fn test_mod_exp() {
         assert_eq!(mod_exp(2, 10, 1000), 24);
         assert_eq!(mod_exp(3, 7, 13), 3);
@@ -298,7 +372,7 @@ mod tests {
         let p = 12289u64;
         for a in [1, 2, 100, 1000, 12288] {
             let inv = mod_inverse(a, p);
-            assert_eq!((a * inv) % p, 1);
+            assert_eq!(mul_mod(a, inv, p), 1);
         }
     }
 }
