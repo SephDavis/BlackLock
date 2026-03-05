@@ -2,6 +2,11 @@
 //! 
 //! This NTT implements negacyclic convolution for the ring Z_q[x]/(x^n + 1),
 //! which is required for Ring-LWE based cryptography.
+//!
+//! For q = 61441: primitive root g = 17
+//!   n=512:  ψ = 421,   ψ⁻¹ = 46701
+//!   n=1024: ψ = 16290, ψ⁻¹ = 58269
+//!   n=2048: ψ = 39003, ψ⁻¹ = 24658
 
 use crate::params::Parameters;
 
@@ -28,7 +33,7 @@ impl NttTables {
         
         // For negacyclic NTT, we need a primitive 2n-th root of unity (psi)
         // such that psi^(2n) = 1 and psi^n = -1
-        // For q = 12289, we have q - 1 = 12288 = 2^12 * 3
+        // For q = 61441, we have q - 1 = 61440 = 2^12 * 3 * 5
         // We need 2n | (q-1), which is satisfied for n = 512, 1024, 2048
         
         let g = find_generator(q);
@@ -36,6 +41,10 @@ impl NttTables {
         let psi = mod_exp(g, (q - 1) / (2 * n as u64), q);
         let psi_inv = mod_inverse(psi, q);
         let n_inv = mod_inverse(n as u64, q);
+        
+        // Verify psi is a primitive 2n-th root of unity
+        debug_assert_eq!(mod_exp(psi, 2 * n as u64, q), 1, "ψ^(2n) ≠ 1");
+        debug_assert_eq!(mod_exp(psi, n as u64, q), q - 1, "ψ^n ≠ -1");
         
         // Precompute powers of psi in bit-reversed order for the NTT
         let psi_powers = compute_powers_bitrev(psi, n, q);
@@ -237,12 +246,14 @@ pub fn mod_inverse(a: u64, m: u64) -> u64 {
 
 /// Find a generator of Z_q^* (primitive root modulo q)
 fn find_generator(q: u64) -> u64 {
-    // For q = 12289, the generator is 11
-    if q == 12289 {
-        return 11;
+    // Known generators for BlackLock primes
+    match q {
+        12289 => return 11,  // legacy (original parameters)
+        61441 => return 17,  // current BlackLock parameters
+        _ => {}
     }
     
-    // General case: find a generator
+    // General case: find a generator by trial
     let phi = q - 1;
     let factors = factorize(phi);
     
@@ -290,6 +301,40 @@ mod tests {
     use crate::params::SecurityLevel;
     
     #[test]
+    fn test_generator() {
+        let q = 61441u64;
+        let g = find_generator(q);
+        assert_eq!(g, 17);
+        // Verify: g^(q-1) = 1, g^((q-1)/2) = q-1
+        assert_eq!(mod_exp(g, q - 1, q), 1);
+        assert_eq!(mod_exp(g, (q - 1) / 2, q), q - 1);
+    }
+    
+    #[test]
+    fn test_psi_values() {
+        let q = 61441u64;
+        let g = 17u64;
+        
+        // n=512: ψ = g^((q-1)/(2*512)) = g^60
+        let psi_512 = mod_exp(g, (q - 1) / (2 * 512), q);
+        assert_eq!(psi_512, 421);
+        assert_eq!(mod_exp(psi_512, 1024, q), 1);   // ψ^(2n) = 1
+        assert_eq!(mod_exp(psi_512, 512, q), q - 1); // ψ^n = -1
+        
+        // n=1024: ψ = g^((q-1)/(2*1024)) = g^30
+        let psi_1024 = mod_exp(g, (q - 1) / (2 * 1024), q);
+        assert_eq!(psi_1024, 16290);
+        assert_eq!(mod_exp(psi_1024, 2048, q), 1);
+        assert_eq!(mod_exp(psi_1024, 1024, q), q - 1);
+        
+        // n=2048: ψ = g^((q-1)/(2*2048)) = g^15
+        let psi_2048 = mod_exp(g, (q - 1) / (2 * 2048), q);
+        assert_eq!(psi_2048, 39003);
+        assert_eq!(mod_exp(psi_2048, 4096, q), 1);
+        assert_eq!(mod_exp(psi_2048, 2048, q), q - 1);
+    }
+    
+    #[test]
     fn test_ntt_roundtrip() {
         let params = SecurityLevel::Low.params();
         let tables = NttTables::new(&params);
@@ -304,12 +349,27 @@ mod tests {
     }
     
     #[test]
+    fn test_ntt_roundtrip_all_levels() {
+        for level in [SecurityLevel::Low, SecurityLevel::Medium, SecurityLevel::High] {
+            let params = level.params();
+            let tables = NttTables::new(&params);
+            
+            let original: Vec<u64> = (0..params.n as u64).map(|x| x % params.q).collect();
+            let mut poly = original.clone();
+            
+            tables.forward(&mut poly);
+            tables.inverse(&mut poly);
+            
+            assert_eq!(original, poly, "NTT roundtrip failed for {:?}", level);
+        }
+    }
+    
+    #[test]
     fn test_ntt_multiplication() {
         // Test that NTT multiplication gives negacyclic convolution
         let params = SecurityLevel::Low.params();
         let tables = NttTables::new(&params);
         let n = params.n;
-        let q = params.q;
         
         // Simple test: (1 + x) * (1 + x) = 1 + 2x + x^2
         let mut a = vec![0u64; n];
@@ -335,7 +395,6 @@ mod tests {
     #[test]
     fn test_negacyclic() {
         // Test that x^n = -1 in the ring
-        // Multiply x^(n-1) * x should give -1 (which is q-1)
         let params = SecurityLevel::Low.params();
         let tables = NttTables::new(&params);
         let n = params.n;
@@ -369,10 +428,10 @@ mod tests {
     
     #[test]
     fn test_mod_inverse() {
-        let p = 12289u64;
-        for a in [1, 2, 100, 1000, 12288] {
+        let p = 61441u64;
+        for a in [1, 2, 100, 1000, 12288, 61440] {
             let inv = mod_inverse(a, p);
-            assert_eq!(mul_mod(a, inv, p), 1);
+            assert_eq!(mul_mod(a, inv, p), 1, "mod_inverse failed for a={}", a);
         }
     }
 }
