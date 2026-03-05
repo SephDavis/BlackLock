@@ -47,6 +47,7 @@ fn main() -> Result<()> {
         "--version" | "-v" => {
             println!("BlackLock v{}", blacklock::VERSION);
             println!("Post-quantum encryption using RLWR");
+            println!("Parameters: q=61441, p=512");
             println!("Author: Toby Davis");
             println!("License: CC BY 4.0");
         }
@@ -74,7 +75,7 @@ USAGE:
 
 COMMANDS:
     keygen [level]              Generate a new keypair
-                                Levels: low (128-bit), medium (192-bit), high (256-bit)
+                                Levels: low (~117-bit), medium (~233-bit), high (~466-bit)
     
     encrypt <pubkey> <message>  Encrypt a message using a public key
     
@@ -96,14 +97,14 @@ EXAMPLES:
 
 ATTRIBUTION REQUIREMENT:
     If you use BlackLock in academic or research projects, you must credit:
-    Toby Davis, "BlackLock: A Post-Quantum Encryption Algorithm Leveraging RLWR"
+    Toby Davis, "BlackLock: A Post-Quantum Encryption Scheme Based on RLWR"
 "#);
 }
 
 fn parse_security_level(level: Option<&str>) -> SecurityLevel {
     match level {
-        Some("low") | Some("128") => SecurityLevel::Low,
-        Some("high") | Some("256") => SecurityLevel::High,
+        Some("low") | Some("117") => SecurityLevel::Low,
+        Some("high") | Some("466") => SecurityLevel::High,
         _ => SecurityLevel::Medium, // Default
     }
 }
@@ -170,14 +171,15 @@ fn run_demo() -> Result<()> {
     println!();
     
     for level in [SecurityLevel::Low, SecurityLevel::Medium, SecurityLevel::High] {
-        println!("━━━ Security Level: {:?} ━━━", level);
+        let params = level.params();
+        println!("━━━ Security Level: {:?} (n={}, q={}, p={}) ━━━", level, params.n, params.q, params.p);
         
         // Key generation
         let start = std::time::Instant::now();
         let keypair = KeyPair::generate(level)?;
         let keygen_time = start.elapsed();
         
-        let message = b"Hello, Post-Quantum World! This is BlackLock.";
+        let message = b"Hello, Post-Quantum World!";
         
         // Encryption
         let start = std::time::Instant::now();
@@ -221,7 +223,7 @@ fn run_benchmark() -> Result<()> {
     
     for level in [SecurityLevel::Low, SecurityLevel::Medium, SecurityLevel::High] {
         let params = level.params();
-        println!("Security Level: {:?} (n={})", level, params.n);
+        println!("Security Level: {:?} (n={}, q={}, p={})", level, params.n, params.q, params.p);
         println!("Running {} iterations...", iterations);
         
         // Benchmark key generation
